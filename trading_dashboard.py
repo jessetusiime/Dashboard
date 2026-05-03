@@ -18,8 +18,6 @@ import warnings
 from collections import Counter
 from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
-load_dotenv()
 
 # ── Suppress third-party deprecation noise ─────────────────────────────────────
 # yfinance uses pd.Timestamp.utcnow() which is deprecated in Pandas 2.x.
