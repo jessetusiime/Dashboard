@@ -18,6 +18,8 @@ import warnings
 from collections import Counter
 from datetime import datetime, timedelta
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Suppress third-party deprecation noise ─────────────────────────────────────
 # yfinance uses pd.Timestamp.utcnow() which is deprecated in Pandas 2.x.
@@ -57,6 +59,14 @@ try:
 except ImportError:
     _AUTOREFRESH = False
     logging.warning("streamlit-autorefresh not installed — auto-refresh disabled.")
+
+# cot_reports — optional (CFTC Commitment of Traders data)
+try:
+    from cot_reports import cot_year
+    _COT_LIB = True
+except ImportError:
+    _COT_LIB = False
+    logging.warning("cot_reports not installed — COT section will be hidden. pip install cot_reports")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1298,6 +1308,16 @@ def inject_global_css() -> None:
     ::-webkit-scrollbar-track {{ background: {_C['bg']}; }}
     ::-webkit-scrollbar-thumb {{ background: {_C['border']}; border-radius: 3px; }}
 
+    /* ── Native st.dataframe container (used by COT section) — same card
+       frame as the rest of the dashboard for visual consistency. Internal
+       header/row colours are rendered by Streamlit's own canvas grid and
+       are not stylable via CSS, but the outer border/radius matches. ── */
+    [data-testid="stDataFrame"] {{
+        border: 1px solid {_C['border']} !important;
+        border-radius: 8px !important;
+        overflow: hidden !important;
+    }}
+
     /* ── Primary button (Run Analysis) ── */
     .stButton button[kind="primary"],
     button[data-testid="baseButton-primary"] {{
@@ -1324,7 +1344,7 @@ def inject_global_css() -> None:
     .t-tbl {{
         width: 100%;
         border-collapse: collapse;
-        font-size: 12px;
+        font-size: 11px;
         background: {_C['surface']};
     }}
     .t-tbl thead tr {{
@@ -1347,11 +1367,12 @@ def inject_global_css() -> None:
     }}
     .t-tbl th.num {{ text-align: right; }}
     .t-tbl td {{
-        padding: 9px 13px;
+        padding: 7px 12px;
         border-bottom: 1px solid {_C['border_sub']};
         color: {_C['text_pri']};
         vertical-align: middle;
         line-height: 1.4;
+        text-align: left;
     }}
     .t-tbl td.num {{
         text-align: right;
@@ -1360,6 +1381,9 @@ def inject_global_css() -> None:
         letter-spacing: 0.03em;
     }}
     .t-tbl tbody tr:last-child td {{ border-bottom: none; }}
+    .t-tbl tbody tr:nth-child(even) td {{
+        background: {_C['surface2']}55;
+    }}
     .t-tbl tbody tr:hover td {{
         background: {_C['surface2']};
         transition: background 0.1s ease;
@@ -1394,7 +1418,7 @@ def inject_global_css() -> None:
         letter-spacing: 0.10em;
         text-transform: uppercase;
         padding: 2px 8px;
-        border-radius: 10px;
+        border-radius: 999px;
         white-space: nowrap;
         font-family: 'JetBrains Mono', monospace;
     }}
@@ -1432,10 +1456,15 @@ def inject_global_css() -> None:
     .kpi-card {{
         flex: 1;
         min-width: 100px;
+        min-height: 92px;
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 6px;
-        padding: 12px 14px;
+        border-radius: 8px;
+        padding: 16px;
+        transition: border-color 0.15s ease;
+    }}
+    .kpi-card:hover {{
+        border-color: {_C['accent']}66;
     }}
     .kpi-lbl {{
         font-size: 9px;
@@ -1448,7 +1477,7 @@ def inject_global_css() -> None:
     .kpi-val {{
         font-family: 'JetBrains Mono', monospace;
         font-size: 24px;
-        font-weight: 500;
+        font-weight: 700;
         color: {_C['text_pri']};
         line-height: 1;
         margin-bottom: 4px;
@@ -1481,8 +1510,12 @@ def inject_global_css() -> None:
     .sbar-outer {{
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 6px;
-        padding: 12px 14px;
+        border-radius: 8px;
+        padding: 16px;
+        transition: border-color 0.15s ease;
+    }}
+    .sbar-outer:hover {{
+        border-color: {_C['accent']}66;
     }}
     .sbar-row {{
         display: flex;
@@ -1535,8 +1568,12 @@ def inject_global_css() -> None:
     .setups-outer {{
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 6px;
-        padding: 12px 14px;
+        border-radius: 8px;
+        padding: 16px;
+        transition: border-color 0.15s ease;
+    }}
+    .setups-outer:hover {{
+        border-color: {_C['accent']}66;
     }}
     .setup-row {{
         display: flex;
@@ -1687,7 +1724,7 @@ def inject_global_css() -> None:
             -webkit-print-color-adjust: exact !important;
             print-color-adjust: exact !important;
         }}
-        .t-tbl, .sbar-outer, .setups-outer, .kpi-card {{
+        .t-tbl, .sbar-outer, .setups-outer, .kpi-card, [data-testid="stDataFrame"] {{
             border: 1px solid #d0d7de !important;
         }}
     }}
@@ -1716,51 +1753,12 @@ def make_bias_cell(bias: str, conf: str | None = None, src_tag: str | None = Non
 
 
 def make_score_cell(score: float) -> str:
-    """
-    Score colored by threshold, monospace.
-    Appends a small directional label so users instantly know
-    whether a high or low score means LONG or SHORT.
-      ≥ 75  → score is bullish-dominant  → append LONG  in green
-      ≤ 25  → score is bearish-dominant  → append SHORT in red
-              (0% in particular = all pillars Bearish = strong short)
-      26–40 → weak bearish lean          → append 'short?' faintly
-    No scoring logic is changed — purely a display annotation.
-    """
-    css = (
-        "sc-rdy" if score >= 75 else
-        "sc-wch" if score >= 60 else
-        "sc-wt"  if score >= 55 else
-        "sc-av"
-    )
-    score_span = f'<span class="{css}">{score:.1f}</span>'
-
-    if score >= 75:
-        dir_span = (
-            f'<span style="font-size:8px;font-weight:700;letter-spacing:0.07em;'
-            f'color:{_C["bullish"]};margin-left:5px;font-family:\'JetBrains Mono\','
-            f'monospace;" title="Score ≥75% — bullish consensus across pillars">LONG</span>'
-        )
-    elif score <= 25:
-        tip = (
-            "Score ≤25% = bearish-dominant signal. "
-            "Low scores are actionable — this is a high-conviction SHORT, not bad data."
-        )
-        dir_span = (
-            f'<span style="font-size:8px;font-weight:700;letter-spacing:0.07em;'
-            f'color:{_C["bearish"]};margin-left:5px;font-family:\'JetBrains Mono\','
-            f'monospace;" title="{tip}">SHORT</span>'
-        )
-    elif 26 <= score <= 40:
-        dir_span = (
-            f'<span style="font-size:8px;font-weight:500;letter-spacing:0.05em;'
-            f'color:{_C["bearish"]};opacity:0.65;margin-left:5px;'
-            f'font-family:\'JetBrains Mono\',monospace;" '
-            f'title="Score 26–40% = weak bearish lean">short?</span>'
-        )
-    else:
-        dir_span = ""
-
-    return score_span + dir_span
+    """Score colored by threshold only — direction shown in Status column."""
+    if score >= 75:   css = "sc-rdy"
+    elif score >= 60: css = "sc-wch"
+    elif score >= 55: css = "sc-wt"
+    else:             css = "sc-av"
+    return f'<span class="{css}">{score:.1f}</span>'
 
 
 def make_card(label: str, value: str, delta: str = "", color: str = "") -> str:
@@ -1779,6 +1777,259 @@ def _bar_color(pct: float) -> str:
     if pct >= 65: return _C["bullish"]
     if pct <= 35: return _C["bearish"]
     return _C["neutral"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MACRO CONTEXT — UST 10Y / 2Y, Yield Curve Spread, VIX
+# ═════════════════════════════════════════════════════════════════════════════
+# Pure addition — no existing logic touched. Uses yfinance only, no API keys.
+
+TTL_MACRO = 3600  # 1 hour
+
+
+@st.cache_data(ttl=TTL_MACRO, show_spinner=False)
+def fetch_macro_context() -> dict:
+    """
+    Fetch US 10Y yield (^TNX), US 2Y yield (FRED DGS2), and VIX (^VIX).
+
+    ^TNX is a CBOE yield index quoted by Yahoo in *index points* equal to
+    yield × 10 (e.g. a 10Y yield of 4.25% shows as 42.5) — divide by 10.
+
+    Yahoo Finance has no reliable 2-Year yield ticker (^UST2Y does not exist).
+    We fetch DGS2 directly from FRED's free public CSV endpoint — no API key
+    required: https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2
+
+    Returns a dict:
+        {
+            "tnx": float | None,        # 10Y yield, %
+            "tnx_5d_chg": float | None,  # change vs 5 trading days ago, pp
+            "us2y": float | None,        # 2Y yield, %
+            "spread": float | None,      # 10Y - 2Y, pp
+            "vix": float | None,         # VIX level
+            "history": pd.DataFrame,     # date, spread — last ~6 months
+            "error": str | None,
+        }
+    """
+    out = {
+        "tnx": None, "tnx_5d_chg": None, "us2y": None,
+        "spread": None, "vix": None,
+        "history": pd.DataFrame(), "error": None,
+    }
+
+    try:
+        # ── 10Y yield (Yahoo quotes this ×10) ─────────────────────────────────
+        tnx_hist = yf.Ticker("^TNX").history(period="7mo", interval="1d")
+
+        if not tnx_hist.empty:
+            tnx_close = tnx_hist["Close"].dropna() / 10.0
+            out["tnx"] = round(float(tnx_close.iloc[-1]), 2)
+            if len(tnx_close) > 5:
+                out["tnx_5d_chg"] = round(float(tnx_close.iloc[-1] - tnx_close.iloc[-6]), 2)
+
+        # ── 2Y yield — FRED public CSV (no API key required) ──────────────────
+        # Yahoo Finance has no reliable 2Y yield ticker. FRED's fredgraph.csv
+        # endpoint is publicly accessible, free, and always current.
+        # URL: https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2
+        two_y_close = pd.Series(dtype=float)
+        try:
+            from io import StringIO as _StringIO
+            _fred_r = requests.get(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2",
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if _fred_r.status_code == 200:
+                _fred_df = pd.read_csv(_StringIO(_fred_r.text), parse_dates=["DATE"])
+                _fred_df = _fred_df[_fred_df["DGS2"] != "."].copy()
+                _fred_df["DGS2"] = pd.to_numeric(_fred_df["DGS2"], errors="coerce")
+                _fred_df = _fred_df.dropna(subset=["DGS2"])
+                # Keep last 7 months to align with TNX history window
+                _cutoff = pd.Timestamp.now() - pd.DateOffset(months=7)
+                _fred_df = _fred_df[_fred_df["DATE"] >= _cutoff]
+                if not _fred_df.empty:
+                    two_y_close = _fred_df.set_index("DATE")["DGS2"]
+        except Exception as _exc:
+            logging.warning("FRED DGS2 fetch failed: %s", _exc)
+
+        # ── Fallback: US Treasury XML API (no key, completely free) ───────────
+        # Fetches the last 7 months of daily yield curve data from Treasury.gov
+        # and extracts BC_2YEAR. Runs only if FRED returned empty.
+        if two_y_close.empty:
+            try:
+                import xml.etree.ElementTree as _ET
+                _ns = {
+                    "a": "http://www.w3.org/2005/Atom",
+                    "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
+                    "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
+                }
+                _tsy_rows = []
+                for _mo in range(7):
+                    _dt = pd.Timestamp.now() - pd.DateOffset(months=_mo)
+                    _url = (
+                        "https://home.treasury.gov/resource-center/data-chart-center/"
+                        f"interest-rates/pages/xml?data=daily_treasury_yield_curve"
+                        f"&field_tdr_date_value={_dt.strftime('%Y%m')}"
+                    )
+                    try:
+                        _tr = requests.get(_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                        if _tr.status_code != 200:
+                            continue
+                        _root = _ET.fromstring(_tr.text)
+                        for _entry in _root.findall(".//a:entry/a:content/m:properties", _ns):
+                            _d_el  = _entry.find("d:NEW_DATE",  _ns)
+                            _y_el  = _entry.find("d:BC_2YEAR",  _ns)
+                            if _d_el is not None and _y_el is not None and _y_el.text:
+                                try:
+                                    _tsy_rows.append({
+                                        "date": pd.to_datetime(_d_el.text),
+                                        "val":  float(_y_el.text),
+                                    })
+                                except Exception:
+                                    pass
+                    except Exception as _exc2:
+                        logging.warning("Treasury XML month %s failed: %s", _dt.strftime("%Y-%m"), _exc2)
+                if _tsy_rows:
+                    _tsy_df = (
+                        pd.DataFrame(_tsy_rows)
+                        .sort_values("date")
+                        .drop_duplicates("date")
+                    )
+                    two_y_close = _tsy_df.set_index("date")["val"]
+                    logging.info("2Y yield loaded from US Treasury XML (%d rows)", len(two_y_close))
+            except Exception as _exc3:
+                logging.warning("US Treasury XML fallback failed: %s", _exc3)
+
+        if not two_y_close.empty:
+            out["us2y"] = round(float(two_y_close.iloc[-1]), 2)
+
+        # ── 10Y-2Y spread + 6-month history ───────────────────────────────────
+        if not tnx_hist.empty and not two_y_close.empty:
+            # Align daily indexes: both to tz-naive date-only
+            tnx_s = (tnx_hist["Close"].dropna() / 10.0)
+            tnx_s.index = pd.to_datetime(tnx_s.index).tz_localize(None).normalize()
+            _2y_s = two_y_close.copy()
+            _2y_s.index = pd.to_datetime(_2y_s.index).normalize()
+            df = pd.DataFrame({"tnx": tnx_s, "us2y": _2y_s}).dropna()
+            df["spread"] = df["tnx"] - df["us2y"]
+            if not df.empty:
+                out["spread"] = round(float(df["spread"].iloc[-1]), 2)
+                hist = df["spread"].reset_index()
+                hist.columns = ["date", "spread"]
+                out["history"] = hist.tail(126)
+
+        # ── VIX ────────────────────────────────────────────────────────────────
+        vix_hist = yf.Ticker("^VIX").history(period="5d", interval="1d")
+        if not vix_hist.empty:
+            out["vix"] = round(float(vix_hist["Close"].dropna().iloc[-1]), 2)
+
+    except Exception as exc:
+        logging.warning("Macro context fetch failed: %s", exc)
+        out["error"] = str(exc)
+
+
+    return out
+
+
+def _vix_regime(vix: float | None) -> tuple[str, str]:
+    """Return (regime_label, colour) for a VIX level."""
+    if vix is None:
+        return "—", _C["text_ter"]
+    if vix > 30:
+        return "Panic", _C["bearish"]
+    if vix > 20:
+        return "Fear", _C["watch_text"]
+    if vix >= 12:
+        return "Normal", _C["bullish"]
+    return "Complacent", _C["neutral"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RENDER: MACRO CONTEXT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_macro_context() -> None:
+    """
+    4-card macro strip: US 10Y yield, US 2Y yield, 10Y-2Y spread (with
+    recession-risk interpretation), and VIX (with regime label).
+    Followed by a compact 6-month line chart of the 10Y-2Y spread.
+    Purely additive — placed between KPI bar and Verdict Matrix.
+    """
+    st.markdown('<p class="sec-hdr">Macro Context</p>', unsafe_allow_html=True)
+
+    macro = fetch_macro_context()
+
+    if macro["error"] and macro["tnx"] is None and macro["vix"] is None:
+        st.markdown(
+            f'<p style="font-size:11px;color:{_C["watch_text"]};">'
+            f'Macro data temporarily unavailable — yfinance could not be reached. '
+            f'Dashboard continues normally.</p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Card 1: US 10Y Yield ───────────────────────────────────────────────────
+    tnx = macro["tnx"]
+    tnx_chg = macro["tnx_5d_chg"]
+    if tnx is not None:
+        tnx_val = f"{tnx:.2f}%"
+        if tnx_chg is not None:
+            chg_col = _C["bullish"] if tnx_chg >= 0 else _C["bearish"]
+            chg_sym = "+" if tnx_chg >= 0 else ""
+            tnx_delta = f'<span style="color:{chg_col};">{chg_sym}{tnx_chg:.2f}pp (5d)</span>'
+        else:
+            tnx_delta = "5d change unavailable"
+    else:
+        tnx_val, tnx_delta = "—", "Data unavailable"
+
+    # ── Card 2: US 2Y Yield ────────────────────────────────────────────────────
+    us2y = macro["us2y"]
+    us2y_val   = f"{us2y:.2f}%" if us2y is not None else "—"
+    us2y_delta = "Short-end policy rate proxy" if us2y is not None else "Data unavailable"
+
+    # ── Card 3: 10Y-2Y Spread ──────────────────────────────────────────────────
+    spread = macro["spread"]
+    if spread is not None:
+        spread_val = f"{spread:+.2f}pp"
+        if spread < 0:
+            spread_col   = _C["bearish"]
+            spread_delta = "Inverted curve → recession risk within 12-18 months"
+        else:
+            spread_col   = _C["bullish"]
+            spread_delta = "Normal curve — no inversion signal"
+    else:
+        spread_val, spread_col, spread_delta = "—", _C["text_ter"], "Data unavailable"
+
+    # ── Card 4: VIX ────────────────────────────────────────────────────────────
+    vix = macro["vix"]
+    regime_lbl, regime_col = _vix_regime(vix)
+    vix_val   = f"{vix:.2f}" if vix is not None else "—"
+    vix_delta = f"Regime: {regime_lbl}" if vix is not None else "Data unavailable"
+
+    st.markdown(
+        '<div class="kpi-row">'
+        + make_card("US 10Y Yield",    tnx_val,    tnx_delta,    _C["text_pri"])
+        + make_card("US 2Y Yield",     us2y_val,   us2y_delta,   _C["text_pri"])
+        + make_card("10Y-2Y Spread",   spread_val, spread_delta, spread_col)
+        + make_card("VIX",             vix_val,    vix_delta,    regime_col)
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── 6-month yield curve spread history ────────────────────────────────────
+    hist = macro["history"]
+    if not hist.empty:
+        chart_df = hist.set_index("date")[["spread"]].rename(columns={"spread": "10Y-2Y Spread (pp)"})
+        st.markdown(
+            f'<p style="font-size:9px;font-weight:700;letter-spacing:0.12em;'
+            f'text-transform:uppercase;color:{_C["text_ter"]};margin:10px 0 4px;">'
+            f'10Y-2Y Spread &middot; 6-Month History</p>',
+            unsafe_allow_html=True,
+        )
+        st.line_chart(
+            chart_df,
+            height=140,
+            color=_C["accent"],
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1908,7 +2159,14 @@ def render_verdict_matrix(results: list[dict]) -> None:
         sent_html   = make_bias_cell(r["sent_bias"])
         fund_html   = make_bias_cell(r["fund_bias"])
         score_html  = make_score_cell(r["score"])
-        status_html = make_badge(r["status"])
+        # Display SHORT for bearish setups (score ≤25), otherwise normal status
+        if r["score"] <= 25:
+            status_html = (
+                f'<span class="pill pill-AVOID" style="background:{_C["bearish_bg"]}; '
+                f'color:{_C["bearish"]}; border:1px solid {_C["bearish"]}33;">SHORT</span>'
+            )
+        else:
+            status_html = make_badge(r["status"])
 
         if r["conflict"]:
             raw_note   = r["conflict_note"]
@@ -2113,23 +2371,13 @@ def main() -> None:
             f'{t}</p>'
         )
 
-        # ── FRED key ──────────────────────────────────────────────────────────
-        st.markdown(_shdr("API Key"), unsafe_allow_html=True)
-        active_fred_key = st.text_input(
-            "FRED API Key",
-            value=FRED_API_KEY,
-            type="password",
-            label_visibility="collapsed",
-            help="Free key from fred.stlouisfed.org — enables live CB rate data.",
-        )
-
         # ── Auto-Refresh ──────────────────────────────────────────────────────
         st.markdown(_sep, unsafe_allow_html=True)
         st.markdown(_shdr("Auto-Refresh"), unsafe_allow_html=True)
         auto_refresh_enabled = st.checkbox(
             "Refresh every 30 minutes",
             value=False,
-            key="auto_refresh_toggle",
+            key="auto_refresh_enabled",
             help="Silently re-runs the full 3-pillar analysis every 30 minutes.",
         )
         if auto_refresh_enabled:
@@ -2184,7 +2432,7 @@ def main() -> None:
     if auto_refresh_enabled and _AUTOREFRESH:
         ar_count   = st_autorefresh(
             interval=AUTO_REFRESH_INTERVAL_SEC * 1000,
-            key="dashboard_autorefresh",
+            key="autorefresh_engine",
         )
         prev_count = st.session_state.get("_ar_count", 0)
         if ar_count > prev_count and "_results" in st.session_state:
@@ -2193,7 +2441,7 @@ def main() -> None:
             for k in ("_results", "_fng", "_tv_429_tripped"):
                 st.session_state.pop(k, None)
             with st.spinner("Auto-refreshing…"):
-                results_new, fng_new = run_full_analysis(active_fred_key)
+                results_new, fng_new = run_full_analysis(FRED_API_KEY)
             st.session_state["_results"]            = results_new
             st.session_state["_fng"]                = fng_new
             st.session_state["_last_analysis_time"] = datetime.now()
@@ -2214,7 +2462,7 @@ def main() -> None:
         run_clicked = render_initial_state()
         if run_clicked:
             with st.spinner("Running 3-pillar analysis across 15 assets…"):
-                results, fng = run_full_analysis(active_fred_key)
+                results, fng = run_full_analysis(FRED_API_KEY)
             st.session_state["_results"]            = results
             st.session_state["_fng"]                = fng
             st.session_state["_last_analysis_time"] = datetime.now()
@@ -2232,6 +2480,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    # ── Macro Context — additive section between KPI bar and Verdict Matrix ──
+    render_macro_context()
+    st.markdown(
+        f'<hr style="border:none;border-top:1px solid {_C["border"]};margin:14px 0;">',
+        unsafe_allow_html=True,
+    )
+
     render_verdict_matrix(results)
     st.markdown(
         f'<hr style="border:none;border-top:1px solid {_C["border"]};margin:14px 0;">',
@@ -2245,6 +2500,9 @@ def main() -> None:
     with col_r:
         setups = build_high_conviction_setups(ccy_strength, top_n=5)
         render_high_conviction_panel(setups)
+
+    # ── COT — Institutional Context Layer (absolute bottom) ───────────────────
+    render_cot_section(results)
 
     # ── Footer — single clean line ────────────────────────────────────────────
     st.markdown(
@@ -2293,6 +2551,700 @@ def main() -> None:
             """,
             unsafe_allow_html=True,
         )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL CONTEXT LAYER — COMMITMENT OF TRADERS (CFTC)
+# Uses the `cot_reports` library (pip install cot_reports).
+# Falls back gracefully if the library or network is unavailable.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Asset → CFTC contract name mapping ───────────────────────────────────────
+# Financial futures: leveraged money columns (lev_money_positions_long_all etc.)
+# Commodity futures: managed money columns (m_money_positions_long_all etc.)
+
+# ── Individual currency → CFTC contract mapping (leveraged money) ───────────
+# FIX: previously COT data was fetched per CURRENCY PAIR (e.g. "EURO FX" used
+# for EUR/USD), which only reflects ONE side of the trade. A pair's true COT
+# bias requires comparing BOTH legs' speculator positioning. We now fetch
+# each of the 8 majors individually — including USD via the ICE USD Index
+# futures contract, the CFTC-reported proxy for dollar positioning — then
+# combine base vs. quote per pair below.
+_COT_CURRENCY_MAP: dict[str, str] = {
+    "EUR": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+    "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
+    "JPY": "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
+    "CHF": "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
+    "CAD": "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "AUD": "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "NZD": "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "USD": "USD INDEX - ICE FUTURES U.S.",
+}
+
+# Dashboard forex pairs → (base_currency, quote_currency). The combined COT
+# signal for a pair is derived from base_net − quote_net (see
+# calculate_cot_pair_signal below).
+_COT_FOREX_PAIRS: dict[str, tuple[str, str]] = {
+    "EUR/USD": ("EUR", "USD"),
+    "GBP/USD": ("GBP", "USD"),
+    "AUD/USD": ("AUD", "USD"),
+    "NZD/USD": ("NZD", "USD"),
+    "USD/CAD": ("USD", "CAD"),
+    "USD/JPY": ("USD", "JPY"),
+    "USD/CHF": ("USD", "CHF"),
+}
+
+# Non-forex financial futures — single-contract handling, unchanged.
+_COT_NONFOREX_FINANCIAL_MAP: dict[str, str] = {
+    "S&P 500": "E-MINI S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE",
+    "NAS 100": "NASDAQ-100 STOCK INDEX MINI - CHICAGO MERCANTILE EXCHANGE",
+    "US 30":   "DJIA x $5 MINI - CHICAGO BOARD OF TRADE",
+    "Bitcoin": "BITCOIN - CHICAGO MERCANTILE EXCHANGE",
+}
+
+_COT_COMMODITY_MAP: dict[str, str] = {
+    "Gold":    "GOLD - COMMODITY EXCHANGE INC.",
+    "Oil WTI": "CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE",
+}
+
+# Velocity thresholds — financial contracts trade larger notional than commodities
+_VEL_THRESH_FIN  = 2000
+_VEL_THRESH_COMM = 1000
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_financial_cot(year: int) -> pd.DataFrame | None:
+    """
+    Fetch Traders-in-Financial-Futures report for `year`.
+    Returns the full DataFrame or None on any failure.
+    Falls back to year-1 if the current year is unavailable.
+    """
+    if not _COT_LIB:
+        return None
+    for yr in (year, year - 1):
+        try:
+            df = cot_year(year=yr, cot_report_type="traders_in_financial_futures_fut")
+            if df is not None and not df.empty:
+                # Normalise column names to lowercase with underscores
+                df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+                return df
+        except Exception as exc:
+            logging.warning("COT financial fetch failed for %d: %s", yr, exc)
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_commodity_cot(year: int) -> pd.DataFrame | None:
+    """
+    Fetch Disaggregated Futures report for `year`.
+    Returns the full DataFrame or None on any failure.
+    Falls back to year-1 if the current year is unavailable.
+    """
+    if not _COT_LIB:
+        return None
+    for yr in (year, year - 1):
+        try:
+            df = cot_year(year=yr, cot_report_type="disaggregated_fut")
+            if df is not None and not df.empty:
+                df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+                return df
+        except Exception as exc:
+            logging.warning("COT commodity fetch failed for %d: %s", yr, exc)
+    return None
+
+
+def _find_name_col(df: pd.DataFrame) -> str | None:
+    """Return the column that holds the contract/market name."""
+    candidates = [
+        "market_and_exchange_names",
+        "contract_market_name",
+        "market_name",
+        "cftc_contract_market_code",
+    ]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # Fuzzy fallback
+    for c in df.columns:
+        if "market" in c and "name" in c:
+            return c
+    return None
+
+
+def _extract_asset_rows(df: pd.DataFrame, contract_name: str) -> pd.DataFrame:
+    """Filter `df` to rows matching `contract_name` (case-insensitive)."""
+    name_col = _find_name_col(df)
+    if name_col is None:
+        return pd.DataFrame()
+    mask = df[name_col].str.upper().str.strip() == contract_name.upper().strip()
+    return df[mask].copy()
+
+
+def _get_net_cols(df: pd.DataFrame, report_type: str) -> tuple[str, str, str]:
+    """
+    Return (long_col, short_col, oi_col) for the appropriate speculator category.
+    Financial: leveraged money.  Commodity: managed money.
+    """
+    if report_type == "financial":
+        long_col  = next((c for c in df.columns if "lev_money" in c and "long"  in c and "all" in c), None)
+        short_col = next((c for c in df.columns if "lev_money" in c and "short" in c and "all" in c), None)
+    else:
+        long_col  = next((c for c in df.columns if "m_money" in c and "long"  in c and "all" in c), None)
+        short_col = next((c for c in df.columns if "m_money" in c and "short" in c and "all" in c), None)
+
+    oi_col = next((c for c in df.columns if "open_interest" in c and "all" in c), None)
+    if oi_col is None:
+        oi_col = next((c for c in df.columns if "open_interest" in c), None)
+
+    return long_col or "", short_col or "", oi_col or ""
+
+
+def _get_cot_currency_series(df: pd.DataFrame, contract_name: str, report_type: str) -> pd.DataFrame:
+    """
+    Build a clean weekly time series for a single CFTC contract.
+    Returns a DataFrame with columns [date, net, oi], sorted chronologically.
+    Used both for non-forex single-contract assets and as the building block
+    for combining two currencies into a forex-pair signal.
+    """
+    asset_rows = _extract_asset_rows(df, contract_name)
+    if asset_rows.empty:
+        return pd.DataFrame()
+
+    long_col, short_col, oi_col = _get_net_cols(asset_rows, report_type)
+    if not long_col or not short_col:
+        return pd.DataFrame()
+
+    rows = asset_rows.copy()
+    rows[long_col]  = pd.to_numeric(rows[long_col],  errors="coerce")
+    rows[short_col] = pd.to_numeric(rows[short_col], errors="coerce")
+    rows            = rows.dropna(subset=[long_col, short_col])
+    if rows.empty:
+        return pd.DataFrame()
+
+    rows["net"] = rows[long_col] - rows[short_col]
+    rows["oi"]  = pd.to_numeric(rows[oi_col], errors="coerce") if oi_col and oi_col in rows.columns else np.nan
+
+    # Date — avoid numeric "yymmdd" code columns (see calculate_cot_signal note)
+    date_col = next((c for c in rows.columns if "date" in c and "yymmdd" not in c), None)
+    if date_col is None:
+        date_col = next((c for c in rows.columns if "date" in c), None)
+    if date_col is None:
+        return pd.DataFrame()
+
+    rows["_date"] = pd.to_datetime(rows[date_col], errors="coerce")
+    rows = rows.dropna(subset=["_date"]).sort_values("_date").reset_index(drop=True)
+
+    return rows[["_date", "net", "oi"]].rename(columns={"_date": "date"})
+
+
+def _signal_from_net_series(
+    net_series: pd.Series,
+    oi_latest: float | None,
+    vel_thresh: float,
+    lookback_weeks: int = 52,
+) -> dict:
+    """
+    Shared classification engine: given a chronologically-ordered net-position
+    series (and optionally the latest open interest), compute velocity,
+    52-week crowding percentile, exposure, and the ordered-priority signal.
+
+    This is the single source of truth for the signal rules so that both
+    single-contract assets (indices, commodities, BTC) and combined forex
+    pairs (base_net − quote_net) are classified identically:
+        percentile > 90            → CROWDED LONGS
+        percentile < 10            → CROWDED SHORTS
+        velocity > +thresh (p<90)  → BUY SETUPS
+        velocity < -thresh (p>10)  → SHORT SETUPS
+        otherwise                  → NEUTRAL
+    """
+    if len(net_series) < 2:
+        return {
+            "velocity": None, "percentile": None, "exposure_pct": None,
+            "signal": "NO DATA", "interpretation": "Insufficient history",
+        }
+
+    current_net  = net_series.iloc[-1]
+    previous_net = net_series.iloc[-2]
+    velocity     = int(current_net - previous_net)
+
+    window   = min(lookback_weeks, len(net_series))
+    net_win  = net_series.iloc[-window:]
+    min_val  = net_win.min()
+    max_val  = net_win.max()
+    if max_val == min_val:
+        percentile = 50.0
+    else:
+        percentile = float((current_net - min_val) / (max_val - min_val) * 100)
+    percentile = round(max(0.0, min(100.0, percentile)), 1)
+
+    exposure_pct: float | None = None
+    if oi_latest and oi_latest > 0:
+        exposure_pct = round(abs(current_net) / oi_latest * 100, 1)
+
+    if percentile > 90:
+        signal, interpretation = "CROWDED LONGS", "Overbought — risk of reversal"
+    elif percentile < 10:
+        signal, interpretation = "CROWDED SHORTS", "Oversold — risk of short squeeze"
+    elif velocity > vel_thresh and percentile < 90:
+        signal, interpretation = "BUY SETUPS", "Institutions accumulating, room to run"
+    elif velocity < -vel_thresh and percentile > 10:
+        signal, interpretation = "SHORT SETUPS", "Institutions distributing, downside ahead"
+    else:
+        signal, interpretation = "NEUTRAL", "Positioning flat, no edge"
+
+    return {
+        "velocity":       velocity,
+        "percentile":     percentile,
+        "exposure_pct":   exposure_pct,
+        "signal":         signal,
+        "interpretation": interpretation,
+    }
+
+
+def calculate_cot_signal(
+    asset_rows: pd.DataFrame,
+    report_type: str,
+    lookback_weeks: int = 52,
+) -> dict:
+    """
+    Single-contract COT signal — used for non-forex assets (indices,
+    commodities, BTC), each backed by exactly one CFTC contract.
+    Forex pairs use calculate_cot_pair_signal() instead (see below),
+    since a pair requires combining two currencies' positioning.
+
+    Returns a dict with keys:
+        velocity, percentile, exposure_pct, signal, interpretation, data_date
+
+    Behavior/output for non-forex assets is unchanged — this function now
+    delegates the velocity/percentile/threshold rules to the shared
+    _signal_from_net_series() classifier so forex pairs and single-contract
+    assets are scored with identical logic.
+    """
+    _FAIL = {
+        "velocity": None, "percentile": None, "exposure_pct": None,
+        "signal": "NO DATA", "interpretation": "Insufficient history",
+        "data_date": None,
+    }
+
+    if asset_rows.empty:
+        return _FAIL
+
+    long_col, short_col, oi_col = _get_net_cols(asset_rows, report_type)
+    if not long_col or not short_col:
+        return _FAIL
+
+    # Ensure numeric
+    try:
+        rows = asset_rows.copy()
+        rows[long_col]  = pd.to_numeric(rows[long_col],  errors="coerce")
+        rows[short_col] = pd.to_numeric(rows[short_col], errors="coerce")
+        rows            = rows.dropna(subset=[long_col, short_col])
+        if len(rows) < 2:
+            return _FAIL
+
+        rows["net"] = rows[long_col] - rows[short_col]
+        rows        = rows.reset_index(drop=True)
+    except Exception as exc:
+        logging.warning("COT signal calc error: %s", exc)
+        return _FAIL
+
+    # ── Data date ────────────────────────────────────────────────────────────
+    # Prefer the real date-string columns; avoid numeric "yymmdd" code columns
+    # (e.g. as_of_date_in_form_yymmdd), which pd.to_datetime mis-parses as
+    # nanosecond timestamps near the 1970 epoch.
+    date_col = next(
+        (c for c in rows.columns
+         if "date" in c and "yymmdd" not in c),
+        None,
+    )
+    if date_col is None:
+        date_col = next((c for c in rows.columns if "date" in c), None)
+    data_date = None
+    if date_col:
+        try:
+            data_date = pd.to_datetime(rows[date_col].iloc[-1]).strftime("%d %b %Y")
+        except Exception:
+            pass
+
+    # ── Latest open interest (for exposure %) ──────────────────────────────────
+    oi_latest = None
+    if oi_col and oi_col in rows.columns:
+        try:
+            oi_latest = pd.to_numeric(rows[oi_col].iloc[-1], errors="coerce")
+        except Exception:
+            oi_latest = None
+
+    vel_thresh = _VEL_THRESH_COMM if report_type == "commodity" else _VEL_THRESH_FIN
+    sig = _signal_from_net_series(rows["net"], oi_latest, vel_thresh, lookback_weeks)
+    sig["data_date"] = data_date
+    return sig
+
+
+def calculate_cot_pair_signal(
+    fin_df: pd.DataFrame | None,
+    base_ccy: str,
+    quote_ccy: str,
+    lookback_weeks: int = 52,
+) -> dict:
+    """
+    FIX: combine two individual currencies' COT positioning into a single
+    forex-pair signal, instead of relying on one currency's contract alone.
+
+        net_diff(week) = base_currency_net(week) − quote_currency_net(week)
+
+    The combined net_diff series is then run through the exact same ordered
+    classification rules as every other asset (via _signal_from_net_series):
+        net_diff velocity > +threshold → BUY SETUPS   (base strength vs quote)
+        net_diff velocity < -threshold → SHORT SETUPS  (quote strength vs base)
+        52w percentile of net_diff > 90 / < 10 → CROWDED LONGS / CROWDED SHORTS
+
+    Exposure % is the average of each leg's own |net| / open-interest ratio,
+    since "% of OI" has no single well-defined meaning across two contracts.
+
+    Returns the same dict shape as calculate_cot_signal:
+        velocity, percentile, exposure_pct, signal, interpretation, data_date
+    """
+    _FAIL = {
+        "velocity": None, "percentile": None, "exposure_pct": None,
+        "signal": "NO DATA", "interpretation": "Insufficient history",
+        "data_date": None,
+    }
+
+    base_contract  = _COT_CURRENCY_MAP.get(base_ccy)
+    quote_contract = _COT_CURRENCY_MAP.get(quote_ccy)
+    if fin_df is None or not base_contract or not quote_contract:
+        return _FAIL
+
+    base_series  = _get_cot_currency_series(fin_df, base_contract,  "financial")
+    quote_series = _get_cot_currency_series(fin_df, quote_contract, "financial")
+    if base_series.empty or quote_series.empty:
+        return _FAIL
+
+    merged = pd.merge(
+        base_series, quote_series, on="date", suffixes=("_base", "_quote"), how="inner"
+    ).sort_values("date").reset_index(drop=True)
+    if len(merged) < 2:
+        return _FAIL
+
+    merged["net_diff"] = merged["net_base"] - merged["net_quote"]
+
+    sig = _signal_from_net_series(merged["net_diff"], None, _VEL_THRESH_FIN, lookback_weeks)
+
+    # Exposure: average of each leg's own % of its own open interest
+    exp_parts: list[float] = []
+    current_base_net  = merged["net_base"].iloc[-1]
+    current_quote_net = merged["net_quote"].iloc[-1]
+    oi_base_latest  = merged["oi_base"].iloc[-1]  if "oi_base"  in merged.columns else None
+    oi_quote_latest = merged["oi_quote"].iloc[-1] if "oi_quote" in merged.columns else None
+    if oi_base_latest and oi_base_latest > 0:
+        exp_parts.append(abs(current_base_net) / oi_base_latest * 100)
+    if oi_quote_latest and oi_quote_latest > 0:
+        exp_parts.append(abs(current_quote_net) / oi_quote_latest * 100)
+    sig["exposure_pct"] = round(sum(exp_parts) / len(exp_parts), 1) if exp_parts else None
+
+    try:
+        sig["data_date"] = pd.to_datetime(merged["date"].iloc[-1]).strftime("%d %b %Y")
+    except Exception:
+        sig["data_date"] = None
+
+    return sig
+
+
+def _cot_vs_verdict(cot_signal: str, verdict_status: str) -> str:
+    """
+    Compare COT signal to the 3-pillar verdict and return alignment label.
+    """
+    bullish_verdicts = {"READY", "WATCH"}
+    if cot_signal == "BUY SETUPS"    and verdict_status in bullish_verdicts: return "ALIGNED"
+    if cot_signal == "SHORT SETUPS"  and verdict_status in bullish_verdicts: return "ALIGNED"
+    if cot_signal == "BUY SETUPS"    and verdict_status in {"AVOID", "WAIT"}: return "CONFLICT"
+    if cot_signal == "SHORT SETUPS"  and verdict_status in {"AVOID", "WAIT"}: return "CONFLICT"
+    if cot_signal in ("CROWDED LONGS", "CROWDED SHORTS") and verdict_status == "READY":
+        return "WARNING"
+    return "—"
+
+
+def _signal_color(signal: str) -> str:
+    """Map signal string to hex colour from the active _C palette."""
+    return {
+        "BUY SETUPS":    _C["bullish"],
+        "SHORT SETUPS":  _C["bearish"],
+        "CROWDED LONGS": _C["watch_text"],
+        "CROWDED SHORTS":_C["watch_text"],
+        "NEUTRAL":       _C["neutral"],
+        "NO DATA":       _C["text_ter"],
+    }.get(signal, _C["text_ter"])
+
+
+def _verdict_color(label: str) -> str:
+    return {
+        "ALIGNED":  _C["bullish"],
+        "CONFLICT": _C["watch_text"],
+        "WARNING":  _C["bearish"],
+        "—":        _C["text_ter"],
+    }.get(label, _C["text_ter"])
+
+
+def render_cot_section(results: list[dict]) -> None:
+    """
+    Standalone COT section — placed at the absolute bottom of the dashboard.
+    Fetches CFTC data, scores each asset, compares to 3-pillar verdict,
+    and renders a clean institutional dataframe.
+
+    If `cot_reports` is not installed or data cannot be fetched the section
+    shows a single-line warning — the rest of the dashboard is unaffected.
+    """
+    # ── Section header — same .sec-hdr + caption pattern as every other
+    #    section (Verdict Matrix, Currency Strength, etc.) for consistency ──
+    st.markdown(
+        f'<hr style="border:none;border-top:1px solid {_C["border"]};margin:20px 0 14px;">',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<p class="sec-hdr">Institutional Context (COT Analysis)</p>', unsafe_allow_html=True)
+    st.caption(
+        "Weekly Commitment of Traders  ·  Large Speculator Positioning  ·  "
+        "Contrarian signal: extreme longs = bearish risk, extreme shorts = bullish risk"
+    )
+
+    if not _COT_LIB:
+        st.markdown(
+            f'<p style="font-size:11px;color:{_C["watch_text"]};">'
+            f'COT section disabled — install the library: '
+            f'<code>pip install cot_reports</code></p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Fetch data (cached 24 h) ──────────────────────────────────────────────
+    cur_year   = datetime.now().year
+    fin_df     = fetch_financial_cot(cur_year)
+    comm_df    = fetch_commodity_cot(cur_year)
+
+    if fin_df is None and comm_df is None:
+        st.markdown(
+            f'<p style="font-size:11px;color:{_C["watch_text"]};">'
+            f'COT data temporarily unavailable — CFTC server could not be reached. '
+            f'Dashboard will retry in 24 hours.</p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Build a verdict lookup: asset name → status ───────────────────────────
+    verdict_map: dict[str, str] = {r["name"]: r["status"] for r in results}
+
+    # ── Score every asset ─────────────────────────────────────────────────────
+    rows_out  = []
+    dates_seen: list[str] = []
+
+    def _process(asset_name: str, contract_name: str,
+                 df: pd.DataFrame | None, report_type: str) -> None:
+        if df is None:
+            rows_out.append({
+                "Asset":          asset_name,
+                "COT Signal":     "NO DATA",
+                "Velocity":       None,
+                "Percentile":     None,
+                "Exposure % OI":  None,
+                "vs Verdict":     "—",
+                "Interpretation": "Data unavailable",
+                "_sig_col":       _C["text_ter"],
+                "_ver_col":       _C["text_ter"],
+            })
+            return
+
+        asset_rows = _extract_asset_rows(df, contract_name)
+        sig        = calculate_cot_signal(asset_rows, report_type)
+
+        if sig["data_date"]:
+            dates_seen.append(sig["data_date"])
+
+        verdict  = verdict_map.get(asset_name, "—")
+        vs_label = _cot_vs_verdict(sig["signal"], verdict)
+
+        rows_out.append({
+            "Asset":          asset_name,
+            "COT Signal":     sig["signal"],
+            "Velocity":       sig["velocity"],
+            "Percentile":     sig["percentile"],
+            "Exposure % OI":  sig["exposure_pct"],
+            "vs Verdict":     vs_label,
+            "Interpretation": sig["interpretation"],
+            "_sig_col":       _signal_color(sig["signal"]),
+            "_ver_col":       _verdict_color(vs_label),
+        })
+
+    def _process_pair(pair_name: str, base_ccy: str, quote_ccy: str,
+                       df: pd.DataFrame | None) -> None:
+        """
+        FIX: forex pairs now combine both currencies' individual COT
+        positioning (base_net − quote_net) instead of relying on a single
+        currency's contract. Same row shape/columns as _process above.
+        """
+        if df is None:
+            rows_out.append({
+                "Asset":          pair_name,
+                "COT Signal":     "NO DATA",
+                "Velocity":       None,
+                "Percentile":     None,
+                "Exposure % OI":  None,
+                "vs Verdict":     "—",
+                "Interpretation": "Data unavailable",
+                "_sig_col":       _C["text_ter"],
+                "_ver_col":       _C["text_ter"],
+            })
+            return
+
+        sig = calculate_cot_pair_signal(df, base_ccy, quote_ccy)
+
+        if sig["data_date"]:
+            dates_seen.append(sig["data_date"])
+
+        verdict  = verdict_map.get(pair_name, "—")
+        vs_label = _cot_vs_verdict(sig["signal"], verdict)
+
+        rows_out.append({
+            "Asset":          pair_name,
+            "COT Signal":     sig["signal"],
+            "Velocity":       sig["velocity"],
+            "Percentile":     sig["percentile"],
+            "Exposure % OI":  sig["exposure_pct"],
+            "vs Verdict":     vs_label,
+            "Interpretation": sig["interpretation"],
+            "_sig_col":       _signal_color(sig["signal"]),
+            "_ver_col":       _verdict_color(vs_label),
+        })
+
+    # Forex pairs — combined base/quote currency signal (the fix)
+    for pair_name, (base_ccy, quote_ccy) in _COT_FOREX_PAIRS.items():
+        _process_pair(pair_name, base_ccy, quote_ccy, fin_df)
+
+    # Non-forex financial assets — unchanged single-contract handling
+    for name, contract in _COT_NONFOREX_FINANCIAL_MAP.items():
+        _process(name, contract, fin_df, "financial")
+
+    # DAX40 — no COT, fixed row
+    rows_out.append({
+        "Asset":          "DAX 40",
+        "COT Signal":     "NO COT DATA",
+        "Velocity":       None,
+        "Percentile":     None,
+        "Exposure % OI":  None,
+        "vs Verdict":     "—",
+        "Interpretation": "No direct COT — use S&P 500 as proxy",
+        "_sig_col":       _C["text_ter"],
+        "_ver_col":       _C["text_ter"],
+    })
+
+    # Commodity assets — unchanged
+    for name, contract in _COT_COMMODITY_MAP.items():
+        _process(name, contract, comm_df, "commodity")
+
+    # ── Build display DataFrame ───────────────────────────────────────────────
+    df_display = pd.DataFrame(rows_out)
+
+    # Styled signal column — colour via markdown HTML in a single column_config
+    # We render the signal as coloured text by injecting minimal HTML
+    def _fmt_signal(row: pd.Series) -> str:
+        return (
+            f'<span style="color:{row["_sig_col"]};font-weight:600;'
+            f'font-family:JetBrains Mono,monospace;font-size:11px;">'
+            f'{row["COT Signal"]}</span>'
+        )
+
+    def _fmt_verdict(row: pd.Series) -> str:
+        return (
+            f'<span style="color:{row["_ver_col"]};font-weight:600;'
+            f'font-size:11px;">'
+            f'{row["vs Verdict"]}</span>'
+        )
+
+    df_display["COT Signal HTML"] = df_display.apply(_fmt_signal, axis=1)
+    df_display["vs Verdict HTML"] = df_display.apply(_fmt_verdict, axis=1)
+
+    # ── Render via st.dataframe with column_config ────────────────────────────
+    render_cols = ["Asset", "COT Signal", "Velocity", "Percentile",
+                   "Exposure % OI", "vs Verdict", "Interpretation"]
+
+    styled = df_display[render_cols].copy()
+
+    st.dataframe(
+        styled,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Asset": st.column_config.TextColumn(
+                "Asset",
+                width="small",
+            ),
+            "COT Signal": st.column_config.TextColumn(
+                "COT Signal",
+                width="medium",
+                help="BUY SETUPS / SHORT SETUPS / CROWDED LONGS / CROWDED SHORTS / NEUTRAL",
+            ),
+            "Velocity": st.column_config.NumberColumn(
+                "Velocity",
+                format="%+d",
+                width="small",
+                help="Week-over-week change in net speculator position (contracts)",
+            ),
+            "Percentile": st.column_config.ProgressColumn(
+                "Percentile (52w)",
+                format="%.0f%%",
+                min_value=0,
+                max_value=100,
+                width="medium",
+                help=">90% = crowded long, <10% = crowded short",
+            ),
+            "Exposure % OI": st.column_config.NumberColumn(
+                "Exposure % OI",
+                format="%.1f%%",
+                width="small",
+                help="|Net positions| as % of open interest",
+            ),
+            "vs Verdict": st.column_config.TextColumn(
+                "vs Verdict",
+                width="small",
+                help="ALIGNED = COT confirms 3-pillar verdict · CONFLICT = opposing · WARNING = crowded at READY",
+            ),
+            "Interpretation": st.column_config.TextColumn(
+                "Interpretation",
+                width="large",
+            ),
+        },
+    )
+
+    # ── Signal colour legend (no emojis) ──────────────────────────────────────
+    legend_items = [
+        ("BUY SETUPS",     _C["bullish"]),
+        ("SHORT SETUPS",   _C["bearish"]),
+        ("CROWDED LONGS",  _C["watch_text"]),
+        ("CROWDED SHORTS", _C["watch_text"]),
+        ("NEUTRAL",        _C["neutral"]),
+        ("ALIGNED",        _C["bullish"]),
+        ("CONFLICT",       _C["watch_text"]),
+        ("WARNING",        _C["bearish"]),
+    ]
+    legend_html = "".join(
+        f'<span style="display:inline-block;margin-right:14px;font-size:9px;'
+        f'font-family:JetBrains Mono,monospace;color:{col};">{lbl}</span>'
+        for lbl, col in legend_items
+    )
+    st.markdown(
+        f'<div style="margin-top:8px;">{legend_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Footer — data date ────────────────────────────────────────────────────
+    latest_date = dates_seen[-1] if dates_seen else "unknown"
+    st.markdown(
+        f'<p style="font-size:9px;color:{_C["text_ter"]};margin-top:8px;'
+        f'font-family:JetBrains Mono,monospace;letter-spacing:0.03em;">'
+        f'COT data updates weekly (Fridays) &nbsp;&middot;&nbsp; '
+        f'Data as of: {latest_date} &nbsp;&middot;&nbsp; '
+        f'Source: CFTC via cot_reports library'
+        f'</p>',
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
