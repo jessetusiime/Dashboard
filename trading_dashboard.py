@@ -1308,16 +1308,6 @@ def inject_global_css() -> None:
     ::-webkit-scrollbar-track {{ background: {_C['bg']}; }}
     ::-webkit-scrollbar-thumb {{ background: {_C['border']}; border-radius: 3px; }}
 
-    /* ── Native st.dataframe container (used by COT section) — same card
-       frame as the rest of the dashboard for visual consistency. Internal
-       header/row colours are rendered by Streamlit's own canvas grid and
-       are not stylable via CSS, but the outer border/radius matches. ── */
-    [data-testid="stDataFrame"] {{
-        border: 1px solid {_C['border']} !important;
-        border-radius: 8px !important;
-        overflow: hidden !important;
-    }}
-
     /* ── Primary button (Run Analysis) ── */
     .stButton button[kind="primary"],
     button[data-testid="baseButton-primary"] {{
@@ -1344,7 +1334,7 @@ def inject_global_css() -> None:
     .t-tbl {{
         width: 100%;
         border-collapse: collapse;
-        font-size: 11px;
+        font-size: 12px;
         background: {_C['surface']};
     }}
     .t-tbl thead tr {{
@@ -1367,12 +1357,11 @@ def inject_global_css() -> None:
     }}
     .t-tbl th.num {{ text-align: right; }}
     .t-tbl td {{
-        padding: 7px 12px;
+        padding: 9px 13px;
         border-bottom: 1px solid {_C['border_sub']};
         color: {_C['text_pri']};
         vertical-align: middle;
         line-height: 1.4;
-        text-align: left;
     }}
     .t-tbl td.num {{
         text-align: right;
@@ -1381,9 +1370,6 @@ def inject_global_css() -> None:
         letter-spacing: 0.03em;
     }}
     .t-tbl tbody tr:last-child td {{ border-bottom: none; }}
-    .t-tbl tbody tr:nth-child(even) td {{
-        background: {_C['surface2']}55;
-    }}
     .t-tbl tbody tr:hover td {{
         background: {_C['surface2']};
         transition: background 0.1s ease;
@@ -1418,7 +1404,7 @@ def inject_global_css() -> None:
         letter-spacing: 0.10em;
         text-transform: uppercase;
         padding: 2px 8px;
-        border-radius: 999px;
+        border-radius: 10px;
         white-space: nowrap;
         font-family: 'JetBrains Mono', monospace;
     }}
@@ -1456,15 +1442,10 @@ def inject_global_css() -> None:
     .kpi-card {{
         flex: 1;
         min-width: 100px;
-        min-height: 92px;
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 8px;
-        padding: 16px;
-        transition: border-color 0.15s ease;
-    }}
-    .kpi-card:hover {{
-        border-color: {_C['accent']}66;
+        border-radius: 6px;
+        padding: 12px 14px;
     }}
     .kpi-lbl {{
         font-size: 9px;
@@ -1477,7 +1458,7 @@ def inject_global_css() -> None:
     .kpi-val {{
         font-family: 'JetBrains Mono', monospace;
         font-size: 24px;
-        font-weight: 700;
+        font-weight: 500;
         color: {_C['text_pri']};
         line-height: 1;
         margin-bottom: 4px;
@@ -1510,12 +1491,8 @@ def inject_global_css() -> None:
     .sbar-outer {{
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 8px;
-        padding: 16px;
-        transition: border-color 0.15s ease;
-    }}
-    .sbar-outer:hover {{
-        border-color: {_C['accent']}66;
+        border-radius: 6px;
+        padding: 12px 14px;
     }}
     .sbar-row {{
         display: flex;
@@ -1568,12 +1545,8 @@ def inject_global_css() -> None:
     .setups-outer {{
         background: {_C['surface']};
         border: 1px solid {_C['border']};
-        border-radius: 8px;
-        padding: 16px;
-        transition: border-color 0.15s ease;
-    }}
-    .setups-outer:hover {{
-        border-color: {_C['accent']}66;
+        border-radius: 6px;
+        padding: 12px 14px;
     }}
     .setup-row {{
         display: flex;
@@ -1724,7 +1697,7 @@ def inject_global_css() -> None:
             -webkit-print-color-adjust: exact !important;
             print-color-adjust: exact !important;
         }}
-        .t-tbl, .sbar-outer, .setups-outer, .kpi-card, [data-testid="stDataFrame"] {{
+        .t-tbl, .sbar-outer, .setups-outer, .kpi-card {{
             border: 1px solid #d0d7de !important;
         }}
     }}
@@ -2994,16 +2967,21 @@ def render_cot_section(results: list[dict]) -> None:
     If `cot_reports` is not installed or data cannot be fetched the section
     shows a single-line warning — the rest of the dashboard is unaffected.
     """
-    # ── Section header — same .sec-hdr + caption pattern as every other
-    #    section (Verdict Matrix, Currency Strength, etc.) for consistency ──
+    # ── Section header ────────────────────────────────────────────────────────
     st.markdown(
         f'<hr style="border:none;border-top:1px solid {_C["border"]};margin:20px 0 14px;">',
         unsafe_allow_html=True,
     )
-    st.markdown('<p class="sec-hdr">Institutional Context (COT Analysis)</p>', unsafe_allow_html=True)
-    st.caption(
-        "Weekly Commitment of Traders  ·  Large Speculator Positioning  ·  "
-        "Contrarian signal: extreme longs = bearish risk, extreme shorts = bullish risk"
+    st.markdown(
+        f'<p style="font-size:9px;font-weight:700;letter-spacing:0.16em;'
+        f'text-transform:uppercase;color:{_C["text_ter"]};margin:0 0 2px;">'
+        f'INSTITUTIONAL CONTEXT (COT ANALYSIS)</p>'
+        f'<p style="font-size:10px;color:{_C["text_sec"]};margin:0 0 12px;">'
+        f'Weekly Commitment of Traders &nbsp;&middot;&nbsp; '
+        f'Large Speculator Positioning &nbsp;&middot;&nbsp; '
+        f'Contrarian signal: extreme longs = bearish risk, extreme shorts = bullish risk'
+        f'</p>',
+        unsafe_allow_html=True,
     )
 
     if not _COT_LIB:
