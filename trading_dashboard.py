@@ -1824,54 +1824,6 @@ def fetch_macro_context() -> dict:
         except Exception as _exc:
             logging.warning("FRED DGS2 fetch failed: %s", _exc)
 
-        # ── Fallback: US Treasury XML API (no key, completely free) ───────────
-        # Fetches the last 7 months of daily yield curve data from Treasury.gov
-        # and extracts BC_2YEAR. Runs only if FRED returned empty.
-        if two_y_close.empty:
-            try:
-                import xml.etree.ElementTree as _ET
-                _ns = {
-                    "a": "http://www.w3.org/2005/Atom",
-                    "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
-                    "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
-                }
-                _tsy_rows = []
-                for _mo in range(7):
-                    _dt = pd.Timestamp.now() - pd.DateOffset(months=_mo)
-                    _url = (
-                        "https://home.treasury.gov/resource-center/data-chart-center/"
-                        f"interest-rates/pages/xml?data=daily_treasury_yield_curve"
-                        f"&field_tdr_date_value={_dt.strftime('%Y%m')}"
-                    )
-                    try:
-                        _tr = requests.get(_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                        if _tr.status_code != 200:
-                            continue
-                        _root = _ET.fromstring(_tr.text)
-                        for _entry in _root.findall(".//a:entry/a:content/m:properties", _ns):
-                            _d_el  = _entry.find("d:NEW_DATE",  _ns)
-                            _y_el  = _entry.find("d:BC_2YEAR",  _ns)
-                            if _d_el is not None and _y_el is not None and _y_el.text:
-                                try:
-                                    _tsy_rows.append({
-                                        "date": pd.to_datetime(_d_el.text),
-                                        "val":  float(_y_el.text),
-                                    })
-                                except Exception:
-                                    pass
-                    except Exception as _exc2:
-                        logging.warning("Treasury XML month %s failed: %s", _dt.strftime("%Y-%m"), _exc2)
-                if _tsy_rows:
-                    _tsy_df = (
-                        pd.DataFrame(_tsy_rows)
-                        .sort_values("date")
-                        .drop_duplicates("date")
-                    )
-                    two_y_close = _tsy_df.set_index("date")["val"]
-                    logging.info("2Y yield loaded from US Treasury XML (%d rows)", len(two_y_close))
-            except Exception as _exc3:
-                logging.warning("US Treasury XML fallback failed: %s", _exc3)
-
         if not two_y_close.empty:
             out["us2y"] = round(float(two_y_close.iloc[-1]), 2)
 
@@ -2536,39 +2488,12 @@ def main() -> None:
 # Financial futures: leveraged money columns (lev_money_positions_long_all etc.)
 # Commodity futures: managed money columns (m_money_positions_long_all etc.)
 
-# ── Individual currency → CFTC contract mapping (leveraged money) ───────────
-# FIX: previously COT data was fetched per CURRENCY PAIR (e.g. "EURO FX" used
-# for EUR/USD), which only reflects ONE side of the trade. A pair's true COT
-# bias requires comparing BOTH legs' speculator positioning. We now fetch
-# each of the 8 majors individually — including USD via the ICE USD Index
-# futures contract, the CFTC-reported proxy for dollar positioning — then
-# combine base vs. quote per pair below.
-_COT_CURRENCY_MAP: dict[str, str] = {
-    "EUR": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
-    "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
-    "JPY": "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
-    "CHF": "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
-    "CAD": "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
-    "AUD": "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
-    "NZD": "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE",
-    "USD": "USD INDEX - ICE FUTURES U.S.",
-}
-
-# Dashboard forex pairs → (base_currency, quote_currency). The combined COT
-# signal for a pair is derived from base_net − quote_net (see
-# calculate_cot_pair_signal below).
-_COT_FOREX_PAIRS: dict[str, tuple[str, str]] = {
-    "EUR/USD": ("EUR", "USD"),
-    "GBP/USD": ("GBP", "USD"),
-    "AUD/USD": ("AUD", "USD"),
-    "NZD/USD": ("NZD", "USD"),
-    "USD/CAD": ("USD", "CAD"),
-    "USD/JPY": ("USD", "JPY"),
-    "USD/CHF": ("USD", "CHF"),
-}
-
-# Non-forex financial futures — single-contract handling, unchanged.
-_COT_NONFOREX_FINANCIAL_MAP: dict[str, str] = {
+_COT_FINANCIAL_MAP: dict[str, str] = {
+    "EUR/USD": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+    "GBP/USD": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
+    "AUD/USD": "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "USD/CAD": "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "USD/JPY": "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
     "S&P 500": "E-MINI S&P 500 STOCK INDEX - CHICAGO MERCANTILE EXCHANGE",
     "NAS 100": "NASDAQ-100 STOCK INDEX MINI - CHICAGO MERCANTILE EXCHANGE",
     "US 30":   "DJIA x $5 MINI - CHICAGO BOARD OF TRADE",
@@ -2672,126 +2597,17 @@ def _get_net_cols(df: pd.DataFrame, report_type: str) -> tuple[str, str, str]:
     return long_col or "", short_col or "", oi_col or ""
 
 
-def _get_cot_currency_series(df: pd.DataFrame, contract_name: str, report_type: str) -> pd.DataFrame:
-    """
-    Build a clean weekly time series for a single CFTC contract.
-    Returns a DataFrame with columns [date, net, oi], sorted chronologically.
-    Used both for non-forex single-contract assets and as the building block
-    for combining two currencies into a forex-pair signal.
-    """
-    asset_rows = _extract_asset_rows(df, contract_name)
-    if asset_rows.empty:
-        return pd.DataFrame()
-
-    long_col, short_col, oi_col = _get_net_cols(asset_rows, report_type)
-    if not long_col or not short_col:
-        return pd.DataFrame()
-
-    rows = asset_rows.copy()
-    rows[long_col]  = pd.to_numeric(rows[long_col],  errors="coerce")
-    rows[short_col] = pd.to_numeric(rows[short_col], errors="coerce")
-    rows            = rows.dropna(subset=[long_col, short_col])
-    if rows.empty:
-        return pd.DataFrame()
-
-    rows["net"] = rows[long_col] - rows[short_col]
-    rows["oi"]  = pd.to_numeric(rows[oi_col], errors="coerce") if oi_col and oi_col in rows.columns else np.nan
-
-    # Date — avoid numeric "yymmdd" code columns (see calculate_cot_signal note)
-    date_col = next((c for c in rows.columns if "date" in c and "yymmdd" not in c), None)
-    if date_col is None:
-        date_col = next((c for c in rows.columns if "date" in c), None)
-    if date_col is None:
-        return pd.DataFrame()
-
-    rows["_date"] = pd.to_datetime(rows[date_col], errors="coerce")
-    rows = rows.dropna(subset=["_date"]).sort_values("_date").reset_index(drop=True)
-
-    return rows[["_date", "net", "oi"]].rename(columns={"_date": "date"})
-
-
-def _signal_from_net_series(
-    net_series: pd.Series,
-    oi_latest: float | None,
-    vel_thresh: float,
-    lookback_weeks: int = 52,
-) -> dict:
-    """
-    Shared classification engine: given a chronologically-ordered net-position
-    series (and optionally the latest open interest), compute velocity,
-    52-week crowding percentile, exposure, and the ordered-priority signal.
-
-    This is the single source of truth for the signal rules so that both
-    single-contract assets (indices, commodities, BTC) and combined forex
-    pairs (base_net − quote_net) are classified identically:
-        percentile > 90            → CROWDED LONGS
-        percentile < 10            → CROWDED SHORTS
-        velocity > +thresh (p<90)  → BUY SETUPS
-        velocity < -thresh (p>10)  → SHORT SETUPS
-        otherwise                  → NEUTRAL
-    """
-    if len(net_series) < 2:
-        return {
-            "velocity": None, "percentile": None, "exposure_pct": None,
-            "signal": "NO DATA", "interpretation": "Insufficient history",
-        }
-
-    current_net  = net_series.iloc[-1]
-    previous_net = net_series.iloc[-2]
-    velocity     = int(current_net - previous_net)
-
-    window   = min(lookback_weeks, len(net_series))
-    net_win  = net_series.iloc[-window:]
-    min_val  = net_win.min()
-    max_val  = net_win.max()
-    if max_val == min_val:
-        percentile = 50.0
-    else:
-        percentile = float((current_net - min_val) / (max_val - min_val) * 100)
-    percentile = round(max(0.0, min(100.0, percentile)), 1)
-
-    exposure_pct: float | None = None
-    if oi_latest and oi_latest > 0:
-        exposure_pct = round(abs(current_net) / oi_latest * 100, 1)
-
-    if percentile > 90:
-        signal, interpretation = "CROWDED LONGS", "Overbought — risk of reversal"
-    elif percentile < 10:
-        signal, interpretation = "CROWDED SHORTS", "Oversold — risk of short squeeze"
-    elif velocity > vel_thresh and percentile < 90:
-        signal, interpretation = "BUY SETUPS", "Institutions accumulating, room to run"
-    elif velocity < -vel_thresh and percentile > 10:
-        signal, interpretation = "SHORT SETUPS", "Institutions distributing, downside ahead"
-    else:
-        signal, interpretation = "NEUTRAL", "Positioning flat, no edge"
-
-    return {
-        "velocity":       velocity,
-        "percentile":     percentile,
-        "exposure_pct":   exposure_pct,
-        "signal":         signal,
-        "interpretation": interpretation,
-    }
-
-
 def calculate_cot_signal(
     asset_rows: pd.DataFrame,
     report_type: str,
     lookback_weeks: int = 52,
 ) -> dict:
     """
-    Single-contract COT signal — used for non-forex assets (indices,
-    commodities, BTC), each backed by exactly one CFTC contract.
-    Forex pairs use calculate_cot_pair_signal() instead (see below),
-    since a pair requires combining two currencies' positioning.
+    Compute weekly momentum velocity, 52-week crowding percentile, and
+    market exposure, then classify into a signal label.
 
     Returns a dict with keys:
         velocity, percentile, exposure_pct, signal, interpretation, data_date
-
-    Behavior/output for non-forex assets is unchanged — this function now
-    delegates the velocity/percentile/threshold rules to the shared
-    _signal_from_net_series() classifier so forex pairs and single-contract
-    assets are scored with identical logic.
     """
     _FAIL = {
         "velocity": None, "percentile": None, "exposure_pct": None,
@@ -2821,7 +2637,33 @@ def calculate_cot_signal(
         logging.warning("COT signal calc error: %s", exc)
         return _FAIL
 
-    # ── Data date ────────────────────────────────────────────────────────────
+    # ── A. Velocity — week-over-week change in net position ──────────────────
+    current_net  = rows["net"].iloc[-1]
+    previous_net = rows["net"].iloc[-2]
+    velocity     = int(current_net - previous_net)
+
+    # ── B. Percentile — 52-week crowding ─────────────────────────────────────
+    window   = min(lookback_weeks, len(rows))
+    net_win  = rows["net"].iloc[-window:]
+    min_val  = net_win.min()
+    max_val  = net_win.max()
+    if max_val == min_val:
+        percentile = 50.0
+    else:
+        percentile = float((current_net - min_val) / (max_val - min_val) * 100)
+    percentile = round(max(0.0, min(100.0, percentile)), 1)
+
+    # ── C. Exposure — |net| as % of open interest ────────────────────────────
+    exposure_pct: float | None = None
+    if oi_col and oi_col in rows.columns:
+        try:
+            oi = pd.to_numeric(rows[oi_col].iloc[-1], errors="coerce")
+            if oi and oi > 0:
+                exposure_pct = round(abs(current_net) / oi * 100, 1)
+        except Exception:
+            pass
+
+    # ── D. Data date ─────────────────────────────────────────────────────────
     # Prefer the real date-string columns; avoid numeric "yymmdd" code columns
     # (e.g. as_of_date_in_form_yymmdd), which pd.to_datetime mis-parses as
     # nanosecond timestamps near the 1970 epoch.
@@ -2839,88 +2681,33 @@ def calculate_cot_signal(
         except Exception:
             pass
 
-    # ── Latest open interest (for exposure %) ──────────────────────────────────
-    oi_latest = None
-    if oi_col and oi_col in rows.columns:
-        try:
-            oi_latest = pd.to_numeric(rows[oi_col].iloc[-1], errors="coerce")
-        except Exception:
-            oi_latest = None
-
+    # ── E. Signal logic (ordered priority) ───────────────────────────────────
     vel_thresh = _VEL_THRESH_COMM if report_type == "commodity" else _VEL_THRESH_FIN
-    sig = _signal_from_net_series(rows["net"], oi_latest, vel_thresh, lookback_weeks)
-    sig["data_date"] = data_date
-    return sig
 
+    if percentile > 90:
+        signal       = "CROWDED LONGS"
+        interpretation = "Overbought — risk of reversal"
+    elif percentile < 10:
+        signal       = "CROWDED SHORTS"
+        interpretation = "Oversold — risk of short squeeze"
+    elif velocity > vel_thresh and percentile < 90:
+        signal       = "BUY SETUPS"
+        interpretation = "Institutions accumulating, room to run"
+    elif velocity < -vel_thresh and percentile > 10:
+        signal       = "SHORT SETUPS"
+        interpretation = "Institutions distributing, downside ahead"
+    else:
+        signal       = "NEUTRAL"
+        interpretation = "Positioning flat, no edge"
 
-def calculate_cot_pair_signal(
-    fin_df: pd.DataFrame | None,
-    base_ccy: str,
-    quote_ccy: str,
-    lookback_weeks: int = 52,
-) -> dict:
-    """
-    FIX: combine two individual currencies' COT positioning into a single
-    forex-pair signal, instead of relying on one currency's contract alone.
-
-        net_diff(week) = base_currency_net(week) − quote_currency_net(week)
-
-    The combined net_diff series is then run through the exact same ordered
-    classification rules as every other asset (via _signal_from_net_series):
-        net_diff velocity > +threshold → BUY SETUPS   (base strength vs quote)
-        net_diff velocity < -threshold → SHORT SETUPS  (quote strength vs base)
-        52w percentile of net_diff > 90 / < 10 → CROWDED LONGS / CROWDED SHORTS
-
-    Exposure % is the average of each leg's own |net| / open-interest ratio,
-    since "% of OI" has no single well-defined meaning across two contracts.
-
-    Returns the same dict shape as calculate_cot_signal:
-        velocity, percentile, exposure_pct, signal, interpretation, data_date
-    """
-    _FAIL = {
-        "velocity": None, "percentile": None, "exposure_pct": None,
-        "signal": "NO DATA", "interpretation": "Insufficient history",
-        "data_date": None,
+    return {
+        "velocity":       velocity,
+        "percentile":     percentile,
+        "exposure_pct":   exposure_pct,
+        "signal":         signal,
+        "interpretation": interpretation,
+        "data_date":      data_date,
     }
-
-    base_contract  = _COT_CURRENCY_MAP.get(base_ccy)
-    quote_contract = _COT_CURRENCY_MAP.get(quote_ccy)
-    if fin_df is None or not base_contract or not quote_contract:
-        return _FAIL
-
-    base_series  = _get_cot_currency_series(fin_df, base_contract,  "financial")
-    quote_series = _get_cot_currency_series(fin_df, quote_contract, "financial")
-    if base_series.empty or quote_series.empty:
-        return _FAIL
-
-    merged = pd.merge(
-        base_series, quote_series, on="date", suffixes=("_base", "_quote"), how="inner"
-    ).sort_values("date").reset_index(drop=True)
-    if len(merged) < 2:
-        return _FAIL
-
-    merged["net_diff"] = merged["net_base"] - merged["net_quote"]
-
-    sig = _signal_from_net_series(merged["net_diff"], None, _VEL_THRESH_FIN, lookback_weeks)
-
-    # Exposure: average of each leg's own % of its own open interest
-    exp_parts: list[float] = []
-    current_base_net  = merged["net_base"].iloc[-1]
-    current_quote_net = merged["net_quote"].iloc[-1]
-    oi_base_latest  = merged["oi_base"].iloc[-1]  if "oi_base"  in merged.columns else None
-    oi_quote_latest = merged["oi_quote"].iloc[-1] if "oi_quote" in merged.columns else None
-    if oi_base_latest and oi_base_latest > 0:
-        exp_parts.append(abs(current_base_net) / oi_base_latest * 100)
-    if oi_quote_latest and oi_quote_latest > 0:
-        exp_parts.append(abs(current_quote_net) / oi_quote_latest * 100)
-    sig["exposure_pct"] = round(sum(exp_parts) / len(exp_parts), 1) if exp_parts else None
-
-    try:
-        sig["data_date"] = pd.to_datetime(merged["date"].iloc[-1]).strftime("%d %b %Y")
-    except Exception:
-        sig["data_date"] = None
-
-    return sig
 
 
 def _cot_vs_verdict(cot_signal: str, verdict_status: str) -> str:
@@ -3051,53 +2838,8 @@ def render_cot_section(results: list[dict]) -> None:
             "_ver_col":       _verdict_color(vs_label),
         })
 
-    def _process_pair(pair_name: str, base_ccy: str, quote_ccy: str,
-                       df: pd.DataFrame | None) -> None:
-        """
-        FIX: forex pairs now combine both currencies' individual COT
-        positioning (base_net − quote_net) instead of relying on a single
-        currency's contract. Same row shape/columns as _process above.
-        """
-        if df is None:
-            rows_out.append({
-                "Asset":          pair_name,
-                "COT Signal":     "NO DATA",
-                "Velocity":       None,
-                "Percentile":     None,
-                "Exposure % OI":  None,
-                "vs Verdict":     "—",
-                "Interpretation": "Data unavailable",
-                "_sig_col":       _C["text_ter"],
-                "_ver_col":       _C["text_ter"],
-            })
-            return
-
-        sig = calculate_cot_pair_signal(df, base_ccy, quote_ccy)
-
-        if sig["data_date"]:
-            dates_seen.append(sig["data_date"])
-
-        verdict  = verdict_map.get(pair_name, "—")
-        vs_label = _cot_vs_verdict(sig["signal"], verdict)
-
-        rows_out.append({
-            "Asset":          pair_name,
-            "COT Signal":     sig["signal"],
-            "Velocity":       sig["velocity"],
-            "Percentile":     sig["percentile"],
-            "Exposure % OI":  sig["exposure_pct"],
-            "vs Verdict":     vs_label,
-            "Interpretation": sig["interpretation"],
-            "_sig_col":       _signal_color(sig["signal"]),
-            "_ver_col":       _verdict_color(vs_label),
-        })
-
-    # Forex pairs — combined base/quote currency signal (the fix)
-    for pair_name, (base_ccy, quote_ccy) in _COT_FOREX_PAIRS.items():
-        _process_pair(pair_name, base_ccy, quote_ccy, fin_df)
-
-    # Non-forex financial assets — unchanged single-contract handling
-    for name, contract in _COT_NONFOREX_FINANCIAL_MAP.items():
+    # Financial assets
+    for name, contract in _COT_FINANCIAL_MAP.items():
         _process(name, contract, fin_df, "financial")
 
     # DAX40 — no COT, fixed row
@@ -3113,7 +2855,7 @@ def render_cot_section(results: list[dict]) -> None:
         "_ver_col":       _C["text_ter"],
     })
 
-    # Commodity assets — unchanged
+    # Commodity assets
     for name, contract in _COT_COMMODITY_MAP.items():
         _process(name, contract, comm_df, "commodity")
 
