@@ -6,3 +6,5 @@ requests
 fredapi
 tradingview-ta
 streamlit-autorefresh
+cot_reports
+python-dotenv
